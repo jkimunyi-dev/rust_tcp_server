@@ -1,19 +1,19 @@
 use std::fmt::Display;
-use std::io::Write;
+use std::io::Read;
+use std::net::TcpListener;
 use std::net::TcpStream;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
-use std::{net::TcpListener, result};
 
-type Result<T> = result::Result<(), T>;
+type Result<T> = std::result::Result<T, ()>;
 
 enum Message {
-    _ClientConnected,
-    _ClientDisconnected,
-    _NewMessage,
+    ClientConnected,
+    ClientDisconnected,
+    NewMessage(Vec<u8>),
 }
 
-const SAFE_MODE: bool = false;
+const SAFE_MODE: bool = true;
 
 #[derive(Debug)]
 struct Sensitive<T>(T);
@@ -30,13 +30,24 @@ impl<T: Display> Display for Sensitive<T> {
     }
 }
 
-fn client(mut stream: TcpStream, _messages: Sender<Message>) -> Result<()> {
-    let _ = writeln!(stream, "Hello friend")
-        .map_err(|err| eprintln!("ERROR : Could not write message to user : {err}"));
+fn client(mut stream: TcpStream, messages: Sender<Message>) -> Result<()> {
+    messages
+        .send(Message::ClientConnected)
+        .map_err(|err| eprintln!("ERROR :  Could not send mesasge to the server thread : {err}"))?;
 
-    println!("{:?}", Sensitive(stream));
+    let mut buffer = Vec::new();
+    buffer.resize(512, 0);
 
-    Ok(())
+    loop {
+        let n = stream.read(&mut buffer).map_err(|_err| {
+            let _ = messages.send(Message::ClientDisconnected);
+            // ()_
+        })?;
+
+        let _ = messages
+            .send(Message::NewMessage(buffer[0..n].to_vec()))
+            .map_err(|err| eprintln!("ERROR : Could not send message to server thread : {err}"))?;
+    }
 }
 
 fn server(_channel: Receiver<Message>) -> Result<()> {
