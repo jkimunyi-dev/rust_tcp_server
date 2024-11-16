@@ -3,13 +3,14 @@ use std::io::Read;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 
 type Result<T> = std::result::Result<T, ()>;
 
 enum Message {
-    ClientConnected,
-    ClientDisconnected,
+    ClientConnected(Arc<TcpStream>),
+    ClientDisconnected(Arc<TcpStream>),
     NewMessage(Vec<u8>),
 }
 
@@ -30,17 +31,17 @@ impl<T: Display> Display for Sensitive<T> {
     }
 }
 
-fn client(mut stream: TcpStream, messages: Sender<Message>) -> Result<()> {
+fn client(stream: Arc<TcpStream>, messages: Sender<Message>) -> Result<()> {
     messages
-        .send(Message::ClientConnected)
+        .send(Message::ClientConnected(stream.clone()))
         .map_err(|err| eprintln!("ERROR :  Could not send mesasge to the server thread : {err}"))?;
 
     let mut buffer = Vec::new();
     buffer.resize(512, 0);
 
     loop {
-        let n = stream.read(&mut buffer).map_err(|_err| {
-            let _ = messages.send(Message::ClientDisconnected);
+        let n = stream.as_ref().read(&mut buffer).map_err(|_err| {
+            let _ = messages.send(Message::ClientDisconnected(stream.clone()));
             // ()_
         })?;
 
@@ -69,6 +70,7 @@ fn main() -> Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                let stream = Arc::new(stream);
                 let message_sender = message_sender.clone();
                 let _ = thread::spawn(|| client(stream, message_sender));
             }
