@@ -2,10 +2,8 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::io::Read;
 use std::io::Write;
-use std::iter;
 use std::net::TcpListener;
 use std::net::TcpStream;
-use std::ops::Deref;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -53,60 +51,95 @@ fn client(stream: Arc<TcpStream>, messages: Sender<Message>) -> Result<()> {
         })
         .map_err(|err| eprintln!("ERROR :  Could not send mesasge to the server thread : {err}"))?;
 
-    let mut buffer = Vec::new();
-    buffer.resize(512, 0);
+    let mut buffer = [0; 512];
 
     loop {
-        let n = stream.as_ref().read(&mut buffer).map_err(|_err| {
-            let _ = messages.send(Message::ClientDisconnected {
-                author: stream.clone(),
-            });
-            // ()_
-        })?;
+        match stream.as_ref().read(&mut buffer) {
+            Ok(0) => {
+                let _ = messages
+                    .send(Message::ClientDisconnected {
+                        author: stream.clone(),
+                    })
+                    .map_err(|err| {
+                        eprintln!("ERROR : Could not send disconnected message : {err}");
+                    });
+                return Ok(());
+            }
 
-        let _ = messages
-            .send(Message::NewMessage {
-                author: stream.clone(),
-                bytes: buffer[0..n].to_vec(),
-            })
-            .map_err(|err| eprintln!("ERROR : Could not send message to server thread : {err}"))?;
+            Ok(n) => {
+                let _ = messages
+                    .send(Message::NewMessage {
+                        author: stream.clone(),
+                        bytes: buffer[0..n].to_vec(),
+                    })
+                    .map_err(|err| {
+                        eprintln!("ERROR : Could not send message to the server thread : {err}")
+                    });
+            }
+
+            Err(_) => {
+                let _ = messages
+                    .send(Message::ClientDisconnected {
+                        author: stream.clone(),
+                    })
+                    .map_err(|err| {
+                        eprintln!("ERROR : Could not send disconnected message : {err}")
+                    });
+
+                return Ok(());
+            }
+        }
     }
 }
 
 fn server(messages: Receiver<Message>) -> Result<()> {
-    let mut clients = HashMap::new();
+    let mut clients: HashMap<String, Client> = HashMap::new();
 
     loop {
-        let msg = messages.recv().expect("The server reciever is not hung up");
+        let msg = messages
+            .recv()
+            .map_err(|err| eprintln!("ERROR : Server reciever failed : {err}"))?;
 
         match msg {
             Message::ClientConnected { author } => {
-                let addr = author
-                    .peer_addr()
-                    .expect("TODO : Cache peer address of the connection");
+                if let Ok(addr) = author.peer_addr() {
+                    let addr_str = addr.to_string();
 
-                clients.insert(
-                    addr.clone(),
-                    Client {
-                        conn: author.clone(),
-                    },
-                );
+                    println!("Client connected : {}", Sensitive(&addr_str));
+
+                    clients.insert(
+                        addr_str,
+                        Client {
+                            conn: author.clone(),
+                        },
+                    );
+                }
             }
             Message::ClientDisconnected { author } => {
-                let addr = author
-                    .peer_addr()
-                    .expect("TODO : Cache peer address of the connection");
+                if let Ok(addr) = author.peer_addr() {
+                    let addr_str = addr.to_string();
 
-                clients.remove(&addr);
+                    println!("Client Disconnected : {}", Sensitive(&addr_str));
+                    clients.remove(&addr_str);
+                }
             }
             Message::NewMessage { author, bytes } => {
-                let author_addr = author
-                    .peer_addr()
-                    .expect("TODO : Cache peer address of the connection");
+                if let Ok(author_addr) = author.peer_addr() {
+                    let author_addr_str = author_addr.to_string();
 
-                for (addr, client) in clients.iter() {
-                    if *addr != author_addr {
-                        let _ = client.conn.as_ref().write(&bytes.to_vec());
+                    // Vector of Clients to Avoid Borrow Checker Issues
+                    let clients_to_send: Vec<_> = clients
+                        .iter()
+                        .filter(|(addr, _)| **addr != author_addr_str)
+                        .map(|(_, client)| client.conn.clone())
+                        .collect();
+
+                    // Send Message to other Clients
+
+                    for client_conn in clients_to_send {
+                        if let Err(err) = client_conn.as_ref().write_all(&bytes) {
+                            eprintln!("Falied to Write to client : {err}");
+                        }
                     }
                 }
             }
@@ -122,7 +155,11 @@ fn main() -> Result<()> {
 
     let (message_sender, message_reciever) = channel();
 
-    thread::spawn(|| server(message_reciever));
+    thread::spawn(move || {
+        if let Err(err) = server(message_reciever) {
+            eprintln!("ERROR : Server Thread failed : {:?}", err);
+        }
+    });
 
     let listener = TcpListener::bind(address)
         .map_err(|err| eprintln!("Could not bind {} : {}", Sensitive(address), Sensitive(err)))?;
