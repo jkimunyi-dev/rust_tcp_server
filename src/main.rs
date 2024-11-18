@@ -1,17 +1,23 @@
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::io::Read;
-use std::io::Write;
-use std::net::TcpListener;
-use std::net::TcpStream;
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::{
+    mpsc::{channel, Receiver, Sender},
+    Arc,
+};
 use std::thread;
+use std::time::{Duration, SystemTime};
+
+const SAFE_MODE: bool = true;
+const BAN_LIMIT: Duration = Duration::from_secs(10 * 60);
 
 type Result<T> = std::result::Result<T, ()>;
 
 struct Client {
     conn: Arc<TcpStream>,
+    last_message: SystemTime,
+    strike_count: i64,
 }
 
 enum Message {
@@ -26,8 +32,6 @@ enum Message {
         bytes: Vec<u8>,
     },
 }
-
-const SAFE_MODE: bool = true;
 
 #[derive(Debug)]
 struct Sensitive<T>(T);
@@ -95,6 +99,10 @@ fn client(stream: Arc<TcpStream>, messages: Sender<Message>) -> Result<()> {
 fn server(messages: Receiver<Message>) -> Result<()> {
     let mut clients: HashMap<String, Client> = HashMap::new();
 
+    let mut banned_mfs: HashMap<String, SystemTime> = HashMap::new();
+
+    let now = SystemTime::now();
+
     loop {
         let msg = messages
             .recv()
@@ -105,14 +113,45 @@ fn server(messages: Receiver<Message>) -> Result<()> {
                 if let Ok(addr) = author.peer_addr() {
                     let addr_str = addr.to_string();
 
+                    let mut banned_at = banned_mfs.remove(&addr.ip().to_string());
+
+                    banned_at = banned_at.and_then(|banned_at| {
+                        let diff = now
+                            .duration_since(banned_at)
+                            .expect("Handle time may have gone backwards");
+
+                        if diff >= BAN_LIMIT {
+                            None
+                        } else {
+                            Some(banned_at)
+                        }
+                    });
                     println!("Client connected : {}", Sensitive(&addr_str));
 
-                    clients.insert(
-                        addr_str,
-                        Client {
-                            conn: author.clone(),
-                        },
-                    );
+                    if let Some(banned_at) = banned_at {
+                        let diff = now
+                            .duration_since(banned_at)
+                            .expect("Handle time may have gone backwards");
+
+                        banned_mfs.insert(addr.ip().to_string(), banned_at);
+                        let mut author = author.as_ref();
+                        writeln!(
+                            author,
+                            "You are banned : {} secs left",
+                            (BAN_LIMIT - diff).as_secs_f32()
+                        );
+
+                        let _ = author.shutdown(Shutdown::Both);
+                    } else {
+                        clients.insert(
+                            addr_str,
+                            Client {
+                                conn: author.clone(),
+                                last_message: SystemTime::now(),
+                                strike_count: 0,
+                            },
+                        );
+                    }
                 }
             }
             Message::ClientDisconnected { author } => {
